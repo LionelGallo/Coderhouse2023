@@ -1,0 +1,929 @@
+# MEJOR USAR EL CAMPO AGENTE COMPENSA_CHAT PORQUE ASI SABES SI FUE EL AGENTE NO FUE OTRO TIPO DE ORDEN QUE LO COMPENSO... --> BIEN AHI LO QUE DICE AGUS.
+DECLARE start_date DATE DEFAULT CURRENT_DATE()-20; 
+
+CREATE TEMP FUNCTION comp_anterior(inicio DATETIME, orden INT64)
+AS (
+(
+SELECT COUNT(u.order_id) 
+FROM `user_compens` as u
+### VOUCHER GIVEN BY AGENT
+WHERE DATETIME(startDate) < inicio and u.order_id = orden 
+and amount is not null
+and DATE(startDate) > "2023-01-01"-8 
+) 
+
+);
+CREATE TEMP FUNCTION cupon_lvl1_costo(costo FLOAT64, pais String)
+AS(
+case when pais = "GT" and costo > 25 then false
+when pais = "PY" and costo > 15000 then false
+when pais = "DO" and costo > 150 then false
+when pais = "HN" and costo > 60 then false
+when pais = "EC" and costo > 3 then false
+when pais = "NI" and costo > 100 then false
+when pais = "PE" and costo > 8 then false
+when pais = "UY" and costo > 150 then false
+when pais = "SV" and costo > 3 then false
+when pais = "CL" and costo > 3300 then false
+when pais = "AR" and costo > 300 then false
+when pais = "PA" and costo > 3 then false
+when pais = "CR" and costo > 2200 then false
+when pais = "BO" and costo > 20 then false
+when pais = "VE" and costo > 3 then false
+else true end
+);
+ 
+
+#WITH COMPENSACIONES2 AS(
+With verificacion as ( 
+with compensaciones as( 
+with hurrier_order as(
+select distinct SAFE_CAST(order_code as INT64) as order_id,
+dt.state as order_status
+,ST_DISTANCE(dt.geo_point,rider.customer.location) < 300 as entrega_dropoff
+,MAX(DATETIME(dt.created_at,h.timezone)) as status_created_at
+from `hurrier_v2` h
+left join UNNEST(rider.deliveries) as d
+left join UNNEST(d.transitions) as dt
+where h.created_date >= start_date -1
+and dt.state = "completed"
+and order_code is not null
+group by 1,2,3
+),
+
+rechazo_orden as(
+select distinct
+r.order_id ,
+r.order_status,
+r.response_date,
+r.response_user_id,
+uu.email,
+fsc.chat_id,
+MAX(response_date) OVER (PARTITION BY r.order_id) AS ultima_modificacion,
+FROM `fact_orders_status_changes` AS r
+INNER JOIN `TABLA_CHATS_HEROCARE_SIN_MENSAJES` AS fsc
+ON r.order_id = SAFE_CAST(fsc.order_id AS INT64)
+and r.order_status = "REJECTED"
+AND DATE(fsc.created_date_localtime) >= start_date - 1
+LEFT JOIN `-.cl_core.user` AS uu
+ON r.response_user_id = uu.id -- el agente que rechazo
+where DATE(response_date) >= start_date -1
+),
+fact_orders as (
+select distinct order_id, restaurant.id,order_status,registered_date,is_acquisition,user.id AS order_user_id --si es primera orden
+from `fact_orders`
+where registered_date >= start_date -1
+),
+oneview as(
+select * from
+`-.cl_gcc_service.oneview_events_v2` 
+right join `-.automated_tables_reports.NominaVMOSupport` u
+on u.MAIL_CORPORATIVO = agent_email  and service = "Customer Service"
+where event_name = 'ActionsPartialRefundDone' OR event_name = 'ActionsCompensationDone' OR event_name ='ActionsFullRefundDone'
+      OR event_name = 'ActionsPartialRefundDone'
+--FULL TODAVIA NO DEJA COMPENSAR ASI POR ONEVIEW
+and created_date>= start_date- 3 ),
+
+trust as(
+SELECT DISTINCT
+order_id,
+trust_segment
+FROM `trust_segment`
+WHERE DATE(order_created_utc) >= start_date  - 2
+
+),
+pagos as (
+with payments as(
+select distinct(o.order_id),
+sum(case when f.type in('CREDIT_CARD','PREPAID_CARD','DEBIT_CARD','BENEFITS_CARD','THIRD_PARTY_ONLINE') then f.amount else 0 end) as amount_online,
+sum(case when f.type = 'WALLET_CREDIT' then f.amount else 0 end) as amount_wallet,
+sum(case when f.type in('CASH','THIRD_PARTY_OFFLINE') then f.amount else 0 end) as amount_offline,
+sum(case when f.type = 'VOUCHER' then f.amount else 0 end) as amount_voucher,
+sum(case when f.type in('PARTNER_DISCOUNT','JOKER','SUBSIDIZED','BINS','PLUS','PRODUCT_DISCOUNT','PARTNERSHIPS','STAMP') then f.amount else 0 end) as amount_discount,
+sum(f.amount) total_amount
+from
+`fact_orders` o, unnest(fundings) f
+where
+registered_date >= DATE_ADD(start_date, interval -2 day)
+group by
+1)
+select order_id,
+case when safe_divide(amount_online,total_amount) = 1
+then 'online'
+when safe_divide(amount_offline,total_amount)= 1
+then 'offline'
+when safe_divide(amount_wallet,total_amount) = 1
+then 'wallet'
+when safe_divide(amount_discount,total_amount) = 1
+then 'discounts'
+when safe_divide(amount_voucher,total_amount) = 1
+then 'voucher'
+when amount_online > 0 and amount_wallet = 0 and amount_offline = 0 and amount_voucher = 0 and amount_discount >= 0
+then 'online'
+when amount_online = 0 and amount_wallet = 0 and amount_offline > 0 and amount_voucher = 0 and amount_discount >= 0
+then 'offline'
+when amount_online = 0 and amount_wallet > 0 and amount_offline = 0 and amount_voucher = 0 and amount_discount >= 0
+then 'wallet'
+when amount_online = 0 and amount_wallet = 0 and amount_offline = 0 and amount_voucher > 0 and amount_discount >= 0
+then 'voucher'
+when amount_online > 0 and amount_wallet = 0 and amount_offline = 0 and amount_voucher > 0 and amount_discount >= 0
+then 'mix_online_coupon'
+when amount_online = 0 and amount_wallet = 0 and amount_offline > 0 and amount_voucher > 0 and amount_discount >= 0
+then 'mix_offline_coupon'
+when amount_online > 0 and amount_wallet > 0 and amount_offline = 0 and amount_voucher = 0 and amount_discount >= 0
+then 'mix_online_wallet'
+when amount_online = 0 and amount_wallet > 0 and amount_offline > 0 and amount_voucher = 0 and amount_discount >= 0
+then 'mix_offline_wallet'
+when amount_online = 0 and amount_wallet > 0 and amount_offline = 0 and amount_voucher > 0 and amount_discount >= 0
+then 'mix_wallet_voucher'
+when amount_online > 0 and amount_wallet > 0 and amount_offline = 0 and amount_voucher > 0 and amount_discount >= 0
+then 'mix_online_wallet_voucher'
+when amount_online = 0 and amount_wallet > 0 and amount_offline > 0 and amount_voucher > 0 and amount_discount >= 0
+then 'mix_offline_wallet_voucher'
+else 'other_mixes'
+end as payment_type
+from payments
+),
+partner as(
+SELECT
+partner_id as id
+,partner_name
+,is_important_account
+,franchise.franchise_name
+,ordersReceptionSystem.name
+,delivery_type
+,business_type.business_type_name AS vertical
+,dc.country_name
+,country_code
+,p.is_logistic
+,timezone
+FROM `dim_partner` AS p
+INNER JOIN `dim_country` AS dc
+ON dc.country_id = p.country_id
+AND dc.country_id <> 6
+AND dc.active
+),
+auto_comp as(
+Select order_id
+,amount
+,reason   --- Si tiene 'GLOBAL_SERVICE_AUTO_COMPENSATION' y es // Cancelación para ver con moi futuro.
+,startDate
+from `user_compens` 
+where type in ('GLOBAL_SERVICE_AUTO_COMPENSATION','USER_COMPENSATION') and date(startDate) >= start_date -5  ---> 'USER_COMPENSATION' es cundo el usuario se contacta, no es una auotocmop en si.. 
+),
+Logios_voucher as (
+select distinct
+conversation_id,
+c_tags.name,
+c_tags.value,
+IFNULL(SPLIT(c_tags.value, '/')[SAFE_OFFSET(2)],"-") AS Cupon,
+IFNULL(SPLIT(c_tags.value, '/')[SAFE_OFFSET(3)],"-") AS Cupon_detail,
+
+FROM `customer_report_tags_and_metrics` lg left join
+UNNEST(conversation_tags) as c_tags
+WHERE c_tags.value LIKE "%%/Voucher/%%"
+and date(_ingested_at) >= start_date-7
+), 
+-- WITH DE ORDENES LOGISTICAS Y RESTARAUNT IGUALES. 13/12/2022.
+
+logistic_and_restraurant AS (
+    SELECT
+      registered_date as date_re,
+      with_logistics,
+      order_id  ,
+      CASE WHEN business_type.business_type_name = 'Courier Business' THEN 'Courier' ELSE business_type.business_type_name END AS vertycal_type_od_y_re,
+    with_logistics as with_logistics_od_y_re
+    FROM
+      `fact_orders`
+    WHERE
+       with_logistics = TRUE 
+       AND registered_date > start_date -2
+       ),
+ 
+RECONTACTO_PRO AS (
+WITH RECONTACTO AS (
+WITH CHATS AS (
+SELECT DISTINCT
+      safe_cast(ch.order_id as int64) as order_id,
+      ch.chat_id,
+     ch.agent_email as agente_chat,
+     SC.agent_email as agente_chat_casos,
+     ch.timezone,
+     ch.contact_reason_l3 as crr3, 
+     DATETIME(assignement_timestamp, CH.timezone) AS start_time, # se le asigna el chat. 
+     DATETIME(closed_timestamp, CH.timezone)  AS end_time,   #sE se cierra el chat.
+     ROW_NUMBER() OVER ( partition by CH.chat_id ORDER BY assignement_timestamp ASC ) AS Contactos_numeros_orden1
+  FROM `TABLA_CHATS_HEROCARE_SIN_MENSAJES` CH
+  LEFT JOIN `TABLA_CASOS_HEROCARE` SC 
+      ON CH.chat_id = SC.pandacare_parent_id
+
+  WHERE DATE(ch.created_date_localtime) >= start_date -3 and 
+     CH.stakeholder = "Customer" #
+
+     order by order_id,start_time
+   ) 
+,hora_cupones AS (
+    SELECT DISTINCT
+    original_order_id, 
+    datetime(created_date) as cupon_hora,
+    cor.destination,
+    backoffice_reason,
+    cor.source,
+    ROW_NUMBER() OVER (partition by original_order_id ORDER BY cor.created_date ASC) AS cupones_orden,
+    FROM `fact_compensations_and_refunds_care`,
+    UNNEST(cor) cor
+    where original_order_date >= start_date -10
+  )
+  Select DISTINCT Contactos_numeros_orden1,order_id,chat_id ,agente_chat,crr3,
+  (CASE WHEN cupon_hora between start_time and end_time  then backoffice_reason else null end) AS backoffice_reason,
+  (CASE WHEN cupon_hora between start_time and end_time  then source else null end) AS Quien_compensa,
+  max(CASE WHEN cupon_hora between start_time and end_time  then true else false end) AS Cupon_en_el_chat,
+  MAX(CASE WHEN cupon_hora between start_time and end_time  then destination else null end) AS Tipo_dev,
+  max(CASE WHEN source NOT IN ( "AGENTS","BACKOFFICE_1VU","BACKOFFICE") or source is null THEN TRUE ELSE FALSE END ) AS AUTOCOMP, 
+  
+  from CHATS
+  RIGHT join hora_cupones hc ON hc.original_order_id = order_id
+  group by 1,2,3,4,5,6,7
+  ORDER BY order_id,Contactos_numeros_orden1
+)
+SELECT *,
+-------- LOGICA RECONTACTO BEGIND
+  CASE 
+      WHEN AUTOCOMP = TRUE AND  COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id) = 0 THEN "CORRECTO"
+      WHEN AUTOCOMP != Cupon_en_el_chat AND COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id) = 1 THEN "CORRECTO"
+      WHEN AUTOCOMP = TRUE AND AUTOCOMP = Cupon_en_el_chat AND  Quien_compensa = "AGENTS" THEN "INCORRECTO"
+      WHEN AUTOCOMP = TRUE AND Quien_compensa = "AGENTS" AND COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id) >= 1 THEN "INCORRECTO"
+      WHEN Contactos_numeros_orden1 = 1 AND AUTOCOMP = TRUE AND Cupon_en_el_chat = TRUE AND COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id ORDER BY Contactos_numeros_orden1) = 1 THEN "CORRECTO"
+      WHEN Contactos_numeros_orden1 >= 1 AND Cupon_en_el_chat = TRUE AND COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id ORDER BY Contactos_numeros_orden1) = 1 THEN "CORRECTO"
+      WHEN Contactos_numeros_orden1 > 1 AND Cupon_en_el_chat = TRUE AND COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id ORDER BY Contactos_numeros_orden1) > 1 THEN "INCORRECTO"
+      WHEN Contactos_numeros_orden1 >= 1 AND COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id ORDER BY Contactos_numeros_orden1) = 0 THEN "INCORRECTO"
+      ELSE "CORRECTO"
+ END AS logica,
+  CASE 
+      WHEN AUTOCOMP = TRUE AND  COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id) = 0 THEN "ORDEN AUTOCOMP"
+      WHEN AUTOCOMP != Cupon_en_el_chat AND COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id) = 1 THEN "CORRECTO YA HAY AUTOCOMP"
+      WHEN AUTOCOMP = TRUE AND AUTOCOMP = Cupon_en_el_chat AND  Quien_compensa = "AGENTS" THEN "INCORRECTO COMPENSA CON AUTOCOMP"
+      WHEN AUTOCOMP = TRUE AND Quien_compensa = "AGENTS" AND COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id) >= 1 THEN "SE COMPENSO Y YA HABIA AUTOCOMP"
+      WHEN Contactos_numeros_orden1 = 1 AND AUTOCOMP = TRUE AND Cupon_en_el_chat = TRUE AND COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id ORDER BY Contactos_numeros_orden1) = 1 THEN "AUTOCOMP"
+      WHEN Contactos_numeros_orden1 >= 1 AND Cupon_en_el_chat = TRUE AND COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id ORDER BY Contactos_numeros_orden1) = 1 THEN "CORRECTO1"
+      WHEN Contactos_numeros_orden1 > 1 AND Cupon_en_el_chat = TRUE AND COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id ORDER BY Contactos_numeros_orden1) > 1 THEN "INCORRECTO_after"
+      WHEN Contactos_numeros_orden1 >= 1 AND COUNTIF(Cupon_en_el_chat = TRUE) OVER(PARTITION BY order_id ORDER BY Contactos_numeros_orden1) = 0 THEN "INCORRECTO"
+      ELSE "CORRECTO3"
+ END AS Detalle_error
+ ------------- LOGICA RECONTACTO END.
+FROM RECONTACTO 
+
+group by 1,2,3,4,5,6,7,8,9,10 ORDER BY  order_id,Contactos_numeros_orden1 ),
+
+RECONTACTO_NEGATIVO AS (
+  WITH RECONTACTO AS (
+WITH CHATS AS (
+SELECT DISTINCT
+      safe_cast(ch.order_id as int64) as order_id,
+      ch.chat_id,
+     ch.agent_email as agente_chat,
+     SC.agent_email as agente_chat_casos,
+     ch.timezone,
+     ch.contact_reason_l3 as crr3, 
+     DATETIME(assignement_timestamp, CH.timezone) AS start_time, # se le asigna el chat. 
+     DATETIME(closed_timestamp, CH.timezone)  AS end_time,   #sE se cierra el chat.
+     ROW_NUMBER() OVER ( partition by CH.chat_id ORDER BY assignement_timestamp ASC ) AS Contactos_numeros_orden1
+  FROM `TABLA_CHATS_HEROCARE_SIN_MENSAJES` CH
+  LEFT JOIN `TABLA_CASOS_HEROCARE` SC 
+      ON CH.chat_id = SC.pandacare_parent_id
+
+  WHERE DATE(ch.created_date_localtime) >= start_date -3 and 
+     CH.stakeholder = "Customer" #
+
+     order by order_id,start_time
+   ) 
+,hora_cupones AS (
+    SELECT DISTINCT
+    original_order_id, 
+    datetime(created_date) as cupon_hora,
+    cor.destination,
+    backoffice_reason,
+    cor.source,
+    ROW_NUMBER() OVER (partition by original_order_id ORDER BY cor.created_date ASC) AS cupones_orden,
+    FROM `fact_compensations_and_refunds_care`,
+    UNNEST(cor) cor
+    where original_order_date >= start_date -10
+  )
+  Select DISTINCT Contactos_numeros_orden1,order_id,chat_id,agente_chat,crr3,
+  (CASE WHEN cupon_hora between start_time and end_time  then backoffice_reason else null end) AS backoffice_reason_NEG,
+  (CASE WHEN cupon_hora between start_time and end_time  then source else null end) AS Quien_compensa,
+  max(CASE WHEN cupon_hora between start_time and end_time  then true else false end) AS Cupon_en_el_chat,
+  MAX(CASE WHEN cupon_hora between start_time and end_time  then destination else null end) AS Tipo_dev,
+  max(CASE WHEN source != "AGENTS" or source is null THEN TRUE ELSE FALSE END ) AS AUTOCOMP, --> hay casos que no aparece lo que es soruce y
+  from CHATS
+  RIGHT join hora_cupones hc ON hc.original_order_id = order_id
+  group by 1,2,3,4,5,6,7
+  ORDER BY order_id,Contactos_numeros_orden1
+)
+SELECT *,
+-------- LOGICA RECONTACTO BEGIND
+  CASE 
+      WHEN AUTOCOMP != TRUE AND Cupon_en_el_chat = TRUE THEN "INCORRECTO"
+      Else "CORRECTO"
+  END AS logica_negativa,
+ ------------- LOGICA RECONTACTO END.
+FROM RECONTACTO 
+
+group by 1,2,3,4,5,6,7,8,9,10 ORDER BY  order_id,Contactos_numeros_orden1 ),
+
+Herramienta_Autocomp as ( -- se agrega 17/02/2023.
+Select distinct
+  a.created_date,
+  a.created_at,
+  a.event_id,
+  a.order_id,
+  a.global_entity_id,
+  a.experiment_name,
+  a.order_value_eur,
+  a.voucher_value_eur,
+  round(safe_divide(a.voucher_value_eur, a.order_value_eur)*100) as comp_percentage, -- Si dice 0 el agente no debe compensar y es correcto :).
+  case 
+   when round(safe_divide(a.voucher_value_eur, a.order_value_eur)*100) = 0 then False 
+   when round(safe_divide(a.voucher_value_eur, a.order_value_eur)*100) is null then False 
+  when round(safe_divide(a.voucher_value_eur, a.order_value_eur)*100) > 0 then True else null end as Aplica_compensar
+from 
+  `autocomp_triggers` a WHERE DATE(created_date) >= start_date -4
+),
+Numeros_contacto_por_orden as (
+  select 
+     safe_cast(ch.order_id as int64) as order_id,
+     ch.chat_id,
+     ch.agent_email as agente_chat,
+     ch.timezone,
+     ch.contact_reason_l3 as crr3,
+     DATETIME(assignement_timestamp, CH.timezone) AS start_time, # se le asigna el chat. 
+     DATETIME(closed_timestamp, CH.timezone)  AS end_time,   #sE se cierra el chat.
+     ROW_NUMBER() OVER ( partition by CH.chat_id ORDER BY assignement_timestamp ASC ) AS Contactos_numeros_orden
+       FROM `TABLA_CHATS_HEROCARE_SIN_MENSAJES` CH  
+ WHERE DATE(ch.created_date_localtime)  >= DATE(start_date) -5
+),
+Ordenes_compensadas_refaund as (
+  SELECT external_reference_id as order_id,
+  payment_method,reason ,source # 17/03 AQUI PUEDO VER POR DONDE FUE COMPENSADO EL AGENTE. YA SEA OV O BACKOFFICE. (AS POR_DONDE_SE_LO_COMPENSA)
+   FROM `refunds`
+  where  date(date_created) >= date_sub(start_date, INTERVAL 3 day) # por las dudas  le reste dias. Como son cupone en formato UTC.
+),
+
+POR_DONDE_SE_PAGO AS( 
+select distinct 
+date(DATETIME(sc.Create_Date)) AS full_date
+ , case_order_id
+ , type as refund_type     
+ , online           
+ , descriptionES
+ , source
+ , is_manual
+ , r.reason
+ , destination
+
+FROM fact_salesforce_cases as sc
+Left join 
+(
+  SELECT DISTINCT 
+  order_id,
+  ord.business_type.business_type_description,
+  with_logistics,restaurant.name,pickup,
+  ord.data.receptionSystem.id, 
+  paymentMethod.online, paymentMethod.descriptionES,rejected_order,Order_status  
+ from fact_orders as ord                 
+ WHERE ord.registered_date >= start_date -5
+) as ord on ord.order_id = SAFE_CAST(sc.case_order_id as int64)     
+                
+left join fact_payments_transaction p on ord.order_id = p.order_id 
+left join `refund` as r on r.payment_id = p.payment_id  -- La relacion es entre Payments ID no entre Orden_ID
+-----------------------------------------------XXX
+WHERE  (date ((sc.Create_date))) >= CURRENT_DATE() -10   
+ and (sc.case_subjec NOT LIKE '%NDC |%' OR sc.case_subjec 
+ NOT LIKE '%No country%' OR sc.case_subjec NOT LIKE '%restaurant portal%')    
+ and sc.Country_name != 'Colombia'
+ AND sc.case_origin IN ('Email', 'Helpcenter','Social Media') 
+ and record_type_name = 'PY Inbound Case' 
+ and sc.case_type =  'Customer'
+---------------------------------------------XXXX
+),
+
+data_cupones as(
+select distinct
+care.original_order_id as orden_compensada,
+flt.order_id as orden_caso,
+ow.order_id is not null as oneview, -- si existe la orden fue por ov, si no existe no fue
+ac.order_id is not null as  autocomp ,-- si existe la orden hubo una autocomp, si no existe no hubo
+DATETIME(ac.startDate) as autocomp_created_at,
+original_order_logistics as with_logistics,
+hu.order_status as estado_hurrier_orden,
+entrega_dropoff,
+fo.order_status as estado_order_bo,
+ro.order_status = "REJECTED" as orden_rechazada,
+status_created_at as estado_hurrier_orden_created_at,
+u.MAIL_CORPORATIVO as email_agente_compensa,
+flt.agent_email as email_agente_chat,
+u.BPO,u.TL_MAIL,u.TM_MAIL,u.LOB,u.PRIMARY_SKILL,u.SECONDARY_SKILL,u.HORARIO,
+DATETIME(ow.created_at, partner.timezone) as date_ov, --fecha oneview   ----> seguir areglando consulta de Oneview
+DATETIME(c.coupon_created_at, partner.timezone) as date_cupon, ---fecha creación cupon
+DATETIME(assignement_timestamp, flt.timezone) AS start_time, # se le asigna el chat. 
+DATETIME(closed_timestamp, flt.timezone)  AS end_time,   #s se cierra el chat.
+DATE(flt.created_date) created_date_chat,
+
+ case when comp_anterior(DATETIME(creation_timestamp,flt.timezone),SAFE_CAST(flt.order_id AS INT64)) = 1 then true else false end as compensacion_anterior, --> correcion de compensacion anteriror.
+logica,
+logica_negativa,
+rec.Quien_compensa, 
+detalle_error,
+flt.chat_id,
+cor.type, -- si fue devolución parcial o total
+cor.status,
+cor.expiration_date, -- USED, REVERT, PENDING, EXPIRED
+DATE(cor.created_date) as created_date_compensation,
+cor.created_date,
+partner.country_code as country,
+case when cor.amount is not null and u.MAIL_CORPORATIVO = flt.agent_email then true
+when cor.amount is null then null
+when cor.amount is not null and u.MAIL_CORPORATIVO != flt.agent_email then false
+end as compensa_agenteChat, -- compensa agente que atiende el chat // sin importar si es tarjeta o cupon.
+cor.amount, --amount redemption
+original_order_amount, --amount orden redemption
+cor.destination, -- voucher, wallet, card
+cor.backoffice_reason, -- ej FOOD_QUALITY
+flt.contact_reason_l3 as ccr3,
+cor.contact_reason, -- ccr de salida
+ts.trust_segment,
+p.payment_type,
+local_contact_reason as local_case_reason,
+is_acquisition = 1 as primera_orden,
+d.gi as gi_delay, ---GESTION INADECUADA DE DELAY <--- attencion aca.
+case when cupon = "AgenteOferta" then true else false end as oferta_cupon,
+user_lifecycle.lifecycle_stage,
+user_lifecycle.health_status,
+logistic_and_restraurant.vertycal_type_od_y_re as vertycal_type_od_y_re,-- tipo de locales
+logistic_and_restraurant.with_logistics_od_y_re as with_logistics_od_y_re, -- si es logistico
+table_com.reason, -- Saber si se dio free dentro de ese case_id. :) granulaidad de orden.
+backoffice_reason_NEG, -- ESPECIFICO CHAT CON BACKOFFICE_ERROENA.
+Aplica_compensar,
+Contactos_numeros_orden, 
+case when refaund.order_id is not null Then True end as existe_Refaund,
+herramienta_pago.source as tipo_pago,
+contact_reason_l1 as case_reason_level_1,
+descriptionES,
+Botones_oneview.Accion_ok_agente	
+
+from `TABLA_CHATS_HEROCARE_SIN_MENSAJES` as flt
+
+left join `-.automated_tables_reports.NominaVMOSupport` u
+on flt.agent_email =u.MAIL_CORPORATIVO and  u.ESTADO = "Activo" --Treaemos solos los acctivos asi no generaamos duplicdad de informacion
+
+left join `-.cl_core.user`u2
+on u2.email = u.MAIL_CORPORATIVO
+
+left join `-.il_growth.fact_talon_coupons` as c
+on SAFE_CAST(flt.order_id as INT64)=c.original_order_id
+and c.agent_id = u2.id
+and DATE(c.coupon_created_at) >= start_date
+
+left join `fact_compensations_and_refunds_care` as care
+on care.original_order_id = safe_cast(flt.order_id as int64)
+and original_order_date >= start_date
+
+left join UNNEST(cor) as cor
+--on cor.id = coupon_id // Entiendo que esto no es necesario --> 07/03/2022.
+left join UNNEST(redemption) as red
+
+LEFT JOIN trust AS ts
+on safe_cast(flt.order_id as int64) = ts.order_id
+left join hurrier_order as hu
+on hu.order_id = safe_cast(flt.order_id as int64)
+left join fact_orders as fo
+on fo.order_id = safe_cast(flt.order_id as int64)
+LEFT JOIN pagos as p
+on p.order_id = safe_cast(flt.order_id as int64)
+left join partner
+on partner.id = fo.id
+left join auto_comp as ac
+on ac.order_id = safe_cast(flt.order_id as int64)
+left join logios_voucher as lv
+on lv.conversation_id = flt.chat_id
+left join rechazo_orden as ro
+on ro.order_id = safe_cast(flt.order_id as int64)
+and ro.response_date = ultima_modificacion 
+left join oneview as ow
+on safe_cast (ow.order_id as int64) = safe_cast(flt.order_id as int64)
+and ow.agent_email = flt.agent_email
+left join `-.user_luis_goncalvez.delay_agents_apego` as d
+on d.case_id = flt.chat_id and d.chat_date_created > start_date -3
+LEFT JOIN
+(
+SELECT
+user_id,
+lifecycle_stage,
+health_status
+FROM
+`agg_user_lifecycle`
+) AS user_lifecycle
+ON order_user_id = user_lifecycle.user_id
+left join logistic_and_restraurant  on  logistic_and_restraurant.order_id =  safe_cast(flt.order_id as int64)
+left join(
+  Select
+  order_id,
+  reason,
+  type,
+  agent.email as agent_emal
+  from
+  `user_compens`) table_com on table_com.order_id = safe_cast(flt.order_id as int64) ---> Subuqery de tabla compensaciones.
+
+left join Herramienta_Autocomp on safe_cast(Herramienta_Autocomp.order_id as int64) = safe_cast(flt.order_id as int64)
+LEFT JOIN Numeros_contacto_por_orden on Numeros_contacto_por_orden.order_id = safe_cast(flt.order_id as int64)
+#and Numeros_contacto_por_orden.start_time = flt.start_time
+LEFT JOIN Ordenes_compensadas_refaund AS refaund on SAFE_CAST(refaund.order_id AS INT64) = safe_cast(flt.order_id as int64) # AGREGO LA TABLA DEL 14/03/2023 PARA tener los datos de las refunds.
+LEFT JOIN POR_DONDE_SE_PAGO as herramienta_pago ON herramienta_pago.case_order_id = flt.order_id ## IDENTIFICAR POR DONDE SE PAGO EL FUE POR OV O POR BO POR EL --> PAYMENT ID <--
+LEFT JOIN  RECONTACTO_PRO rec on rec.chat_id = flt.chat_id
+LEFT JOIN  RECONTACTO_NEGATIVO rec_N on rec_n.chat_id = flt.chat_id 
+
+LEFT JOIN `-.user_patrick_marabote.FREE_DELIVERY` as Botones_oneview --> SE AGERGA BOTONES EN ONEVIEW PARA LO QUE ES FREE DELIVERY 10/10/23
+ON Botones_oneview.case_id = flt.chat_id and Botones_oneview.agent_email = flt.agent_email
+
+WHERE DATE(flt.created_date_localtime) >= start_date
+and flt.stakeholder = "Customer"
+-- chats de CS
+)
+
+
+
+select * except (lifecycle_stage,gi_delay),
+case 
+--
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3  in  ('Food quality','Missing item','Wrong item') and  (with_logistics = false or with_logistics_od_y_re = false ) and oferta_cupon and not cupon_lvl1_costo(amount,country)
+and  (logica_negativa ="INCORRECTO")
+then "Compensa vendor cupon mayor lvl 1 PDI"
+---
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 not in ('Food quality','Missing item','Wrong item','Wrong order') and (logica_negativa ="INCORRECTO") AND (with_logistics = false or with_logistics_od_y_re = false) then "Compensa vendor"
+--x
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ('Wrong item') and estado_hurrier_orden != "completed" and estado_hurrier_orden_created_at < end_time and (logica ="INCORRECTO" OR logica IS NULL)
+then "Compensa con orden no completada PDI"
+
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ('Missing item')  and estado_hurrier_orden != "completed" and estado_hurrier_orden_created_at < end_time and(logica_negativa ="INCORRECTO")
+
+and reason not in ('Problemas con wallet')
+then "Compensa y es error - PDI" -- Free delivery 3
+
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ('Wrong item') and (country = "República Dominicana" or country = "DO")and lower(descriptionES) = "efectivo" and (logica_negativa ="INCORRECTO")
+then "Es Rep Dominicana efectivo PDI"
+
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ('Missing item')   and (country = "República Dominicana" or country = "DO") and lower(descriptionES) = "efectivo" and (logica_negativa ="INCORRECTO")
+and reason not in ('Problemas con wallet') 
+then "Es Rep Dominicana efectivo PDI" -- Free delivery 5
+
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ('Food quality') and (country = "República Dominicana" or country = "DO") and lower(descriptionES) = "efectivo" and (logica_negativa ="INCORRECTO")
+then "Es Rep Dominicana efectivo PDI1"
+
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ("Food temperature") and (country = "República Dominicana" or country = "DO") and lower(descriptionES) = "efectivo" and ( with_logistics = false or with_logistics_od_y_re = false )and  vertycal_type_od_y_re in  ('Restaurant') AND (logica_negativa ="INCORRECTO")
+then "Es Rep Dominicana efectivo PDI" 
+
+when compensa_agenteChat and ccr3 in ('Wrong order') and estado_hurrier_orden != "completed" and estado_hurrier_orden_created_at < end_time
+or ccr3 in ('Wrong order') and tipo_pago is not null and (logica_negativa ="INCORRECTO")
+then "Compensa con orden no completada PDI"
+
+when compensa_agenteChat and ccr3 in ('Wrong order') and(country = "República Dominicana" or country = "DO") and lower(descriptionES) = "efectivo" AND (logica_negativa ="INCORRECTO")
+then "Es Rep Dominicana efectivo PDI"
+----xxxxxxx--------
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ('Wrong item') and backoffice_reason_NEG not in ("WRONG_ITEM","WRONG_ITEM", "Producto incorrecto", "Pedido incompleto/faltaron productos","Devolución parcial de Groceries","Producto faltante") 
+and (logica_negativa ="INCORRECTO")
+then "BackOffice reason errónea"
+
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ('Missing item')  and backoffice_reason_NEG  not in ("PRODUCT_MISSING",'WALLET_ISSUE',"PRODUCT_MISSING","MISSING_ITEM","Producto faltante","Producto faltante", "Pedido incompleto/faltaron productos","Problemas con wallet",'Devolución parcial de Groceries','Orden incorrecta') 
+and (logica_negativa ="INCORRECTO")
+then "BackOffice reason errónea" 
+
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ('Food quality') and backoffice_reason_NEG not in ("FOOD_QUALITY", "Calidad de la comida","Calidad del producto") and (logica_negativa ="INCORRECTO")
+then "BackOffice reason errónea"
+
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ("Food temperature")  and (with_logistics = false or with_logistics_od_y_re = false)  and  vertycal_type_od_y_re not in  ('Restaurant') and  vertycal_type_od_y_re not in ('Courier')  and backoffice_reason_NEG not in ("FOOD_TEMPERATURE", "Calidad de la comida","Temperatura del pedido") 
+and (logica_negativa ="INCORRECTO")
+then "BackOffice reason errónea" --> 1 
+
+when compensa_agenteChat and ccr3 in ('Wrong order') and backoffice_reason_NEG not in ("Orden incorrecta","WRONG_ITEM","WRONG_ORDER","Pedido incorrecto","Orden incorrecta","Pedido incompleto/faltaron productos",'PRODUCT_INCORRECT') and (logica_negativa ="INCORRECTO")
+then"BackOffice reason errónea"
+
+------------xxxxx--- arreglar omdar 4/5/2023
+
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ("Order marked as delivered but didn't receive") and ccr3 in ("Order will not be processed")  and estado_order_bo = "REJECTED"
+and vertycal_type_od_y_re not in ('Courier') and  (logica_negativa ="INCORRECTO")
+then "Compensa y es error OMAD - Live"
+
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ("Order marked as delivered but didn't receive") and vertycal_type_od_y_re not in ('Courier') and local_case_reason = "Entrega con código" and estado_order_bo = "REJECTED" and  (logica_negativa ="INCORRECTO")
+then "Compensa y es error OMAD - Live"
+
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ("Order marked as delivered but didn't receive") and vertycal_type_od_y_re not in ('Courier') and estado_order_bo != "REJECTED" and  (logica_negativa ="INCORRECTO")
+then "Compensa y es error OMAD - Live"
+
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) IS NOT NULL and ccr3 in ("Order marked as delivered but didn't receive") and
+payment_type = "online" and primera_orden and entrega_dropoff and estado_hurrier_orden = "completed" and estado_hurrier_orden_created_at < end_time and estado_order_bo = "REJECTED" and (logica_negativa ="INCORRECTO")
+and vertycal_type_od_y_re  not in ('Courier')
+then "Compensa y es error OMAD - Live"
+
+------------xxxxx---
+
+-- ACYNC(Aplica Compensar y no compensa) ----->>>>> Aqui cambia la logica de vouchers que viene antes(Mapear el error) y se mapea cuando debio compensar y no compenso. #IMPORTANTE.
+
+when 
+COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) is null and ccr3 in ('Wrong item')
+and (with_logistics = true or with_logistics_od_y_re = true) 
+and estado_hurrier_orden = "completed" and estado_hurrier_orden_created_at < end_time
+and (country = "República Dominicana" or country = "DO") and descriptionES != "Efectivo"
+and vertycal_type_od_y_re not in ('Courier')
+AND trust_segment != "Untrusted"
+and (logica ="INCORRECTO" OR logica IS NULL) 
+then "Aplica devolver y no devuelve PDI"
+--
+when 
+ COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) is null and ccr3 in ('Missing item')
+and (with_logistics = true or with_logistics_od_y_re = true)
+and estado_hurrier_orden = "completed" and estado_hurrier_orden_created_at < end_time
+and (country = "República Dominicana" or country = "DO") and descriptionES != "Efectivo"
+and vertycal_type_od_y_re not in ('Courier')
+--and reason in ('Problemas con wallet') 
+AND trust_segment != "Untrusted"
+and  (logica ="INCORRECTO" OR logica IS NULL)
+then "Aplica devolver y no devuelve PDI" 
+--
+when 
+ COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) is null and ccr3 in ('Wrong item')
+and (with_logistics = true or with_logistics_od_y_re = true)
+and estado_hurrier_orden = "completed" and estado_hurrier_orden_created_at < end_time
+and country = "UY" and payment_type in ("wallet") and local_case_reason = "Cúpon"
+and vertycal_type_od_y_re not in ('Courier')
+and (logica ="INCORRECTO" OR logica IS NULL)
+AND trust_segment != "Untrusted"
+then "Aplica devolver y no devuelve PDI"
+--
+--
+when COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) is null and ccr3 in ('Wrong item')
+and (with_logistics = true or with_logistics_od_y_re = true)
+and estado_hurrier_orden = "completed" and estado_hurrier_orden_created_at < end_time
+and country != "DO"
+and vertycal_type_od_y_re not in ('Courier')
+and (logica ="INCORRECTO" OR logica IS NULL)
+AND trust_segment != "Untrusted"
+then "Aplica devolver y no devuelve PDI"
+--
+when 
+ COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) is null and ccr3 in ('Missing item')
+and (with_logistics = true or with_logistics_od_y_re = true)--> solo estaba dando error.
+and estado_hurrier_orden = "completed" and estado_hurrier_orden_created_at < end_time
+AND trust_segment != "Untrusted"
+and (country != "República Dominicana" or country != "DO")
+and vertycal_type_od_y_re not in ('Courier')
+and (logica ="INCORRECTO" OR logica IS NULL)
+then "Aplica devolver y no devuelve PDI"
+--
+when 
+ COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) is null and ccr3 in ('Food quality')
+and (with_logistics = true or with_logistics_od_y_re = true)
+and (country = "República Dominicana" or country = "DO") and descriptionES != "Efectivo"
+and vertycal_type_od_y_re in ('Food quality')
+and (logica ="INCORRECTO" OR logica IS NULL)
+then "Aplica devolver y no devuelve PDI"
+--
+when 
+ COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) is null and ccr3 in ("Fungi","Chocolate issue")
+and (with_logistics = true or with_logistics_od_y_re = true)
+and (country = "República Dominicana" or country = "DO") and descriptionES != "Efectivo"
+and vertycal_type_od_y_re  in ('Restaurant') # Solo se mide RESUARANT EN ESTE CRR3 
+and(logica ="INCORRECTO" OR logica IS NULL)
+AND trust_segment != "Untrusted"
+then "Aplica devolver y no devuelve PDI" --> 5 
+--
+when  
+COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) is null 
+and ccr3 in ('Food quality')
+and country != "DO"
+and (logica ="INCORRECTO" OR logica IS NULL)
+and vertycal_type_od_y_re in ('Restaurant')
+AND trust_segment != "Untrusted"
+then "Aplica devolver y no devuelve PDI"
+-- 
+when  
+COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) is null
+and ccr3 in ("Fungi","Chocolate issue","")
+and (with_logistics = true or with_logistics_od_y_re = true) 
+and vertycal_type_od_y_re  in  ('Restaurant')
+and (country != "República Dominicana" or country != "DO")
+AND trust_segment != "Untrusted"
+and (logica ="INCORRECTO" OR logica IS NULL)
+then "Aplica devolver y no devuelve PDI" --> arreglar esto para el aplique 
+
+when   
+COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(tipo_pago AS STRING)) is null and ccr3 in ('Wrong order')
+and (with_logistics = true or with_logistics_od_y_re = true)
+and estado_hurrier_orden = "completed" and estado_hurrier_orden_created_at < end_time
+and vertycal_type_od_y_re not in ('Courier')
+and (country != "República Dominicana" or country != "DO")
+and (logica ="INCORRECTO" OR logica IS NULL)
+AND trust_segment != "Untrusted"
+then "Aplica devolver y no devuelve PDI"
+--
+when   
+COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(tipo_pago AS STRING)) is null and ccr3 in ('Wrong order')
+and (with_logistics = true or with_logistics_od_y_re = true)
+and estado_hurrier_orden = "completed" and estado_hurrier_orden_created_at < end_time
+and (country = "República Dominicana" or country = "DO") and descriptionES != "Efectivo"
+and vertycal_type_od_y_re not in ('Courier')
+and (logica ="INCORRECTO" OR logica IS NULL)
+AND trust_segment != "Untrusted"
+then "Aplica devolver y no devuelve PDI"
+
+-- fin
+when Aplica_compensar = True and   COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) is null and ccr3 in ('Other voucher inquiry')
+and (status = "EXPIRED" or DATETIME(expiration_date) < end_time)
+and orden_rechazada
+and (logica ="INCORRECTO" OR logica IS NULL)
+AND trust_segment != "Untrusted"
+and vertycal_type_od_y_re not in ('Courier')
+then "Aplica devolver y no devuelve PDI"
+-- fin
+when Aplica_compensar = True and  
+COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) is null and ccr3 in ("Order marked as delivered but didn't receive")
+-- fin
+and orden_rechazada != true
+and vertycal_type_od_y_re not in ('Courier')
+and payment_type = "online"
+and (local_case_reason != "Entrega con código" or local_case_reason is null)
+and (logica ="INCORRECTO" OR logica IS NULL)
+AND trust_segment != "Untrusted"
+then "Aplica devolver y no devuelve PDI"
+-- fin
+
+when compensa_agenteChat and ccr3 in ('Food temperature') and vertycal_type_od_y_re in ('Restaurant') and autocomp != True  and (logica_negativa ="INCORRECTO")
+then"CCR3 no aplica compensar" ---> ya que para es espefico
+--
+when compensa_agenteChat is not null and ccr3 not in("Order marked as delivered but didn't receive",'Other voucher inquiry','Wrong order','Missing item','Wrong item','Food quality', "Food Temperature","Request: order is late, does not want to wait",'Complaint about moderate delay','Complaint about severe delay','Complaint about extreme delay',"Restaurant hasn't started preparing the food,'Complaint about short delay",'Cancellation reason inquiry','Complain about late order','Spilled food','Check order status',"Information request","Inappropriate behaviour",'Money collection issue','Damaged item','Request: changed mind','Promotion/discount not applied','Fungi','Chocolate issue','Request: Partner closed for pickup','Label issues','Rider related inquiry',
+"Refund query ",
+"Expired Item",
+"Product Quantity",
+"Online payment issue",
+"Loyalty program issue",
+"Food items",
+"Refund request",
+"Voucher not received",
+"Spam / Irrelevant ",
+"Product Quality",
+"Near expiry date",
+"Loyalty program inquiry",
+"Promotions and deals inquiry",
+"Cannot apply"
+)
+and (logica_negativa ="INCORRECTO") and autocomp != True
+then "CCR3 no aplica compensar" 
+
+
+----------------------->>>> Agregamos Restaurant hasn't started preparing the food--> dentro de las conidciones que no aplica compensar.
+
+-- debia otorgar cupon y no lo otrorga
+when Aplica_compensar = True and  
+ COALESCE(SAFE_CAST(compensa_agenteChat AS STRING), SAFE_CAST(existe_Refaund AS STRING)) is null and ccr3 in ("Restaurant hasn't started preparing the food") and orden_rechazada = true
+ and vertycal_type_od_y_re not in ('Courier')
+and (logica ="INCORRECTO" OR logica IS NULL)
+then "Aplica comp/ref y no realiza accion - LIVE"
+-- otorga el cupon mal.
+when Aplica_compensar = False and  
+ compensa_agenteChat is true and ccr3 in ("Restaurant hasn't started preparing the food") and orden_rechazada = true
+ and vertycal_type_od_y_re not in ('Courier')
+then "comp/ref y es error  LIVE"
+
+-- debia otorgar cupon y no lo otrorga. 
+when Aplica_compensar = True and  
+compensa_agenteChat is null and ccr3  in ('Complaint about short delay')and orden_rechazada = true and contact_reason in ('Request: order is late, does not want to wait')  
+AND trust_segment != "Untrusted"
+and vertycal_type_od_y_re not in ('Courier') 
+then "Error Delay"
+
+-- El si otortga un cupon y esta mal
+when Aplica_compensar = True and  
+compensa_agenteChat and ccr3  in ('Complaint about short delay')and orden_rechazada = true and contact_reason not in('Request: order is late, does not want to wait') and (logica ="INCORRECTO" OR logica IS NULL)
+and vertycal_type_od_y_re not in ('Courier')
+AND trust_segment != "Untrusted"
+then "Error Delay"
+
+-- OLD DELAY SE VA POR CONDICIONES DIRECTAS Y USAMOS PARTE DE QUERY DE FREE DELILVERY.
+#when ccr3 in ('Complaint about short delay','Complaint about moderate delay','Complaint about severe delay','Complaint about extreme delay','Request: order is late, does not want to wait') 
+#and vertycal_type_od_y_re not in ('Courier')
+#and gi_delay = 1 and Aplica_compensar  = True and (logica ="INCORRECTO" OR logica IS NULL) then "Error Delay"
+
+
+when ccr3 in ('Complaint about short delay','Complaint about moderate delay','Complaint about severe delay','Complaint about extreme delay','Request: order is late, does not want to wait') 
+  and Aplica_compensar  = True
+  and (Accion_ok_agente = 1 or compensa_agenteChat is not null) 
+  and (with_logistics = false or with_logistics_od_y_re = false) then "Error Delay"
+
+when ccr3 in ('Complaint about short delay','Complaint about moderate delay','Complaint about severe delay','Complaint about extreme delay','Request: order is late, does not want to wait') 
+  and Aplica_compensar  = True
+  and (Accion_ok_agente = 1 or compensa_agenteChat is not null)
+  and trust_segment = "Untrusted" then "Error Delay"
+
+when ccr3 in ('Complaint about short delay','Complaint about moderate delay','Complaint about severe delay','Complaint about extreme delay','Request: order is late, does not want to wait') 
+  and Aplica_compensar  = True
+  and (Accion_ok_agente = 1 or compensa_agenteChat is not null)
+  and   autocomp = True  then "Error Delay"
+
+when ccr3 in ('Complaint about short delay','Complaint about moderate delay','Complaint about severe delay','Complaint about extreme delay','Request: order is late, does not want to wait') 
+  and Aplica_compensar  = True
+  and (Accion_ok_agente = 0 or compensa_agenteChat is null)
+  and  autocomp != True and  trust_segment != "Untrusted"   
+  and (with_logistics = true or with_logistics_od_y_re = true)
+  and (logica ="INCORRECTO" OR logica IS NULL)
+  then "Aplica_delay y no compensa"
+
+--#  AND trust_segment != "Untrusted" and (with_logistics = true or with_logistics_od_y_re = true)
+
+
+
+
+-- Incorrecta otorgacion de cupon
+when ccr3 in ('Missing item','Wrong order') and Accion_ok_agente = 1 AND trust_segment != "Untrusted" and (with_logistics = true or with_logistics_od_y_re = true)  and Aplica_compensar  = True and vertycal_type_od_y_re not in ('Courier') and country not in ('CR') and  autocomp != True then 'Aplica Compensar Free-delivery y no compensa' #luego ver de mejorar esto.
+--courier
+when ccr3 in ('Missing item','Wrong order') and Accion_ok_agente = 1 and vertycal_type_od_y_re in ('Courier')   then 'Compensa free y no corresponde' 
+--
+when ccr3 in ('Missing item','Wrong order') and Accion_ok_agente = 1  and (with_logistics = false or with_logistics_od_y_re = false) then 'Compensa free y no corresponde'
+--
+else "Sin error" end as error_compensacion
+from data_cupones
+)
+select compensaciones.* ,
+COUNT(distinct case when error_compensacion in ("Sin error") then compensaciones.chat_id else null end)/COUNT(distinct compensaciones.chat_id) as apego
+
+from compensaciones
+
+LEFT JOIN  `-.user_patrick_marabote.MICROCHATS_HERO_CARE` micro 
+ON compensaciones.CHAT_ID =  micro.chat_id  
+
+WHERE TIPO_CHAT = "NORMAL"
+
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62
+)
+##Lo llamo de esta manera asi a la hora de crear la tabla puedo seguir agregando elementos. Queria hacer un * no expcluia se ve lo que necesitaba.
+Select distinct orden_compensada as orden_compensada ,
+orden_caso  as orden_caso,
+oneview as oneview, 
+MAX(autocomp) as autocomp ,
+MAX(autocomp_created_at) as autocomp_created_at ,
+MAX(COALESCE(with_logistics,with_logistics_od_y_re)) as with_logistics ,
+MAX(estado_hurrier_orden) as estado_hurrier_orden ,
+MAX(entrega_dropoff) as entrega_dropoff ,
+MAX(estado_order_bo) as estado_order_bo ,
+MAX(orden_rechazada) as orden_rechazada ,
+MAX(estado_hurrier_orden_created_at) as estado_hurrier_orden_created_at,
+MAX(email_agente_compensa) as email_agente_compensa ,
+MAX(email_agente_chat) as email_agente_chat ,
+MAX(BPO) as BPO ,
+MAX(TL_MAIL) as TL_MAIL,
+MAX(TM_MAIL)  as TM_MAIL,
+MAX(LOB) as LOB ,
+MAX(PRIMARY_SKILL)  as PRIMARY_SKILL,
+MAX(SECONDARY_SKILL) as SECONDARY_SKILL ,
+MAX(HORARIO) as HORARIO,
+MAX(date_ov) as date_ov,
+MAX(date_cupon) as date_cupon,
+MAX(start_time)  as start_time,
+MAX(end_time) as end_time , 
+MAX(created_date_chat)  as created_date_chat,
+MAX(SAFE_CAST(compensacion_anterior AS INT64))  as compensacion_anterior,
+CHAT_ID AS case_id ,
+MAX("1") as chat_transcript_id,
+MAX(type)  as type,
+MAX(status) as status ,
+MAX(expiration_date) as expiration_date ,
+MAX(created_date_compensation) as created_date_compensation ,
+MAX(created_date) as created_date ,
+MAX(country) as country,
+MAX(compensa_agenteChat)  as compensa_agenteChat,
+MAX(amount) as amount ,
+MAX(original_order_amount) as original_order_amount ,
+MAX(destination)  as destination,
+MAX(backoffice_reason) as backoffice_reason ,
+MAX(ccr3) as ccr3,
+MAX("1") as ccr3_entrada,
+MAX(contact_reason)  as contact_reason,
+MAX(trust_segment) as trust_segment ,
+MAX(payment_type)  as payment_type,
+MAX(local_case_reason)  as local_case_reason,
+MAX(primera_orden)  as primera_orden,
+MAX(oferta_cupon)  as oferta_cupon,
+MAX(error_compensacion) as error_compensacion ,
+MAX(apego) as apego, 
+MAX(vertycal_type_od_y_re) as vertycal_type_od_y_re,
+MAX(with_logistics_od_y_re) as with_logistics_od_y_re,
+max(logica) as Recontacto,
+max(Aplica_compensar) as Habilitado_compensar2,
+MAX(Contactos_numeros_orden) AS Contactos_numeros_orden,
+case_reason_level_1 # lo pude agus para ver los tipos de casos Lvl_1
+
+from verificacion where (case when local_case_reason  LIKE "%TEST SUPER HEAVY VIP%" and start_date between date('2023-01-01') and current_date() then 1 else 0 end ) = 0 
+AND created_date_chat >= start_date
+
+# AND (with_logistics is not null OR with_logistics_od_y_re IS NOT NULL)  # AND  orden_compensada IS NOT NULL
+
+group by orden_compensada ,orden_caso ,oneview,CHAT_ID,case_reason_level_1,detalle_error,Quien_compensa
+order by orden_caso,start_time,error_compensacion 
